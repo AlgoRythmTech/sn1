@@ -563,8 +563,10 @@ class SupernovaTrainer:
             weight_decay=self.config.weight_decay
         )
         
-        # Calculate training steps
+        # Calculate total training steps once
         total_steps = len(self.train_loader) * self.config.max_epochs
+        if self.config.max_steps:
+            total_steps = min(total_steps, self.config.max_steps)
         warmup_steps = self.config.warmup_steps
         
         # Create scheduler with linear warmup and cosine decay
@@ -576,20 +578,6 @@ class SupernovaTrainer:
             anneal_strategy='cos',
             cycle_momentum=False
         )
-        
-        # Calculate total steps
-        total_steps = len(self.train_loader) * self.config.max_epochs
-        if self.config.max_steps:
-            total_steps = min(total_steps, self.config.max_steps)
-        
-        # Linear warmup followed by cosine decay
-        warmup_steps = self.config.warmup_steps
-        
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
         
         # Setup mixed precision
         if self.config.mixed_precision:
