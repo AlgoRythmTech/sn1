@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from tqdm import tqdm
 import random
 import numpy as np
+import math
 
 from supernova_model import SupernovaForCausalLM, SupernovaConfig, create_supernova_model
 from tokenizer import SupernovaTokenizer, format_training_example
@@ -496,25 +497,38 @@ class SupernovaTrainer:
     def setup_optimizer_and_scheduler(self):
         """Setup optimizer and learning rate scheduler"""
         
-        # Setup optimizer
+        # Initialize weights with a smaller range
+        def init_weights(module):
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                module.weight.data.normal_(mean=0.0, std=0.02)
+                if isinstance(module, nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
+        
+        self.model.apply(init_weights)
+        
+        # Setup optimizer with parameter-specific settings
         no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters() 
                           if not any(nd in n for nd in no_decay) and p.requires_grad],
                 "weight_decay": self.config.weight_decay,
+                "lr": self.config.learning_rate,
             },
             {
                 "params": [p for n, p in self.model.named_parameters() 
                           if any(nd in n for nd in no_decay) and p.requires_grad],
                 "weight_decay": 0.0,
+                "lr": self.config.learning_rate,
             },
         ]
         
         self.optimizer = AdamW(
             optimizer_grouped_parameters,
             lr=self.config.learning_rate,
-            eps=1e-8
+            eps=1e-8,
+            betas=(0.9, 0.999),  # Default AdamW betas
+            weight_decay=self.config.weight_decay
         )
         
         # Calculate total steps
@@ -522,12 +536,14 @@ class SupernovaTrainer:
         if self.config.max_steps:
             total_steps = min(total_steps, self.config.max_steps)
         
-        # Setup scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=total_steps,
-            eta_min=self.config.learning_rate * 0.1
-        )
+        # Linear warmup followed by cosine decay
+        warmup_steps = self.config.warmup_steps
+        
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
         
         # Setup mixed precision
         if self.config.mixed_precision:
@@ -548,6 +564,10 @@ class SupernovaTrainer:
             outputs = self.model(**batch)
             loss = outputs['loss']
             
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.logger.warning(f"Found NaN/Inf loss: {loss.item()}")
+                return float('nan')
+            
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
         
@@ -556,6 +576,16 @@ class SupernovaTrainer:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        
+        # Log gradient norms for debugging
+        if (self.global_step + 1) % self.config.logging_steps == 0:
+            total_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            self.logger.info(f"Gradient norm: {total_norm:.4f}")
         
         return loss.item() * self.config.gradient_accumulation_steps
     
@@ -831,19 +861,23 @@ def main():
     # Training configuration
     config = TrainingConfig(
         model_name="enhanced-supernova",
-        batch_size=4,
-        gradient_accumulation_steps=4,
-        learning_rate=3e-5,
+        batch_size=2,  # Reduced batch size
+        gradient_accumulation_steps=8,  # Increased gradient accumulation
+        learning_rate=1e-5,  # Lower learning rate
         max_epochs=15,
         max_sequence_length=1024,
         output_dir="outputs",
         train_data_path="sample_train_data.json",
         mixed_precision=True,
-        gradient_clipping=1.0,
-        warmup_steps=50,
+        gradient_clipping=0.5,  # More aggressive gradient clipping
+        warmup_steps=200,  # More warmup steps
         eval_steps=50,
         save_steps=100,
-        logging_steps=5
+        logging_steps=5,
+        weight_decay=0.05,  # Added weight decay
+        mask_user_tokens=True,  # Focus on generating responses
+        system_message_weight=0.2,  # Reduce system message influence
+        response_loss_weight=1.0  # Full weight on assistant responses
     )
     
     # Create trainer and start training
