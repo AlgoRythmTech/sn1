@@ -404,9 +404,20 @@ class SupernovaTrainer:
             self.model.load_state_dict(checkpoint)
         else:
             self.logger.info("Creating new Supernova model")
-            self.model = create_supernova_model(
-                vocab_size=len(self.tokenizer)
+            # Create model with full vocab size
+            config = SupernovaConfig(
+                vocab_size=len(self.tokenizer),
+                hidden_size=768,
+                num_hidden_layers=12,
+                num_attention_heads=12,
+                intermediate_size=3072,
+                hidden_dropout_prob=0.1,
+                attention_probs_dropout_prob=0.1,
+                max_position_embeddings=1024,
+                type_vocab_size=2,
+                initializer_range=0.02
             )
+            self.model = create_supernova_model(config=config)
         
         # Move model to device
         self.model.to(self.device)
@@ -559,8 +570,37 @@ class SupernovaTrainer:
         # Move batch to device
         batch = {k: v.to(self.device) for k, v in batch.items()}
         
-        # Forward pass
-        with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+        # Clear gradients
+        self.optimizer.zero_grad()
+        
+        # Forward pass with gradient computation
+        loss = None
+        if self.config.mixed_precision:
+            with torch.cuda.amp.autocast():
+                outputs = self.model(**batch)
+                loss = outputs['loss']
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.warning(f"Found NaN/Inf loss: {loss.item()}")
+                    return float('nan')
+                
+                # Scale loss for gradient accumulation
+                loss = loss / self.config.gradient_accumulation_steps
+            
+            # Scale and backward
+            scaled_loss = self.scaler.scale(loss)
+            scaled_loss.backward()
+            
+            # Gradient clipping
+            if self.config.gradient_clipping > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            
+            # Update weights
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+        else:
             outputs = self.model(**batch)
             loss = outputs['loss']
             
@@ -570,12 +610,13 @@ class SupernovaTrainer:
             
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
-        
-        # Backward pass
-        if self.config.mixed_precision:
-            self.scaler.scale(loss).backward()
-        else:
             loss.backward()
+            
+            # Gradient clipping
+            if self.config.gradient_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            
+            self.optimizer.step()
         
         # Log gradient norms for debugging
         if (self.global_step + 1) % self.config.logging_steps == 0:
@@ -861,22 +902,22 @@ def main():
     # Training configuration
     config = TrainingConfig(
         model_name="enhanced-supernova",
-        batch_size=2,  # Reduced batch size
-        gradient_accumulation_steps=8,  # Increased gradient accumulation
-        learning_rate=1e-5,  # Lower learning rate
+        batch_size=1,  # Single sample for stable training
+        gradient_accumulation_steps=16,  # Increased for effective batch size
+        learning_rate=5e-6,  # Even lower learning rate for stability
         max_epochs=15,
         max_sequence_length=1024,
         output_dir="outputs",
         train_data_path="sample_train_data.json",
         mixed_precision=True,
-        gradient_clipping=0.5,  # More aggressive gradient clipping
-        warmup_steps=200,  # More warmup steps
+        gradient_clipping=0.1,  # More aggressive gradient clipping
+        warmup_steps=500,  # More warmup steps
         eval_steps=50,
         save_steps=100,
         logging_steps=5,
-        weight_decay=0.05,  # Added weight decay
-        mask_user_tokens=True,  # Focus on generating responses
-        system_message_weight=0.2,  # Reduce system message influence
+        weight_decay=0.01,  # Reduced weight decay
+        mask_user_tokens=False,  # Allow model to learn from all tokens
+        system_message_weight=1.0,  # Full weight on system messages
         response_loss_weight=1.0  # Full weight on assistant responses
     )
     
