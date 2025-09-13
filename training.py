@@ -321,6 +321,9 @@ class SupernovaTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         
+        # Create output directory first
+        os.makedirs(config.output_dir, exist_ok=True)
+        
         # Set up logging
         logging.basicConfig(
             level=logging.INFO,
