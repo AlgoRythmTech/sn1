@@ -168,54 +168,46 @@ class ConversationDataset(Dataset):
         example: Dict[str, torch.Tensor], 
         messages: List[Dict[str, str]]
     ) -> Dict[str, torch.Tensor]:
-        """Apply conversation-specific loss masking"""
-        
+        """Apply conversation-specific loss masking and guarantee at least one unmasked label."""
         input_ids = example['input_ids']
         labels = example['labels'].clone()
-        
+
         # Create a more sophisticated masking strategy
         # We want to train primarily on assistant responses
-        
-        # Convert messages to text to find positions
         full_text = self.tokenizer.format_chat_prompt(messages, add_generation_prompt=False)
-        
-        # Find assistant response positions and apply different weights
         current_pos = 0
         for message in messages:
             role = message['role']
             content = message['content']
-            
             if role == 'system':
-                # Partially mask system messages (light training signal)
                 role_text = f"{self.tokenizer.special_tokens['system_token']} {content}\n"
                 role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                
-                # Apply reduced weight to system tokens
                 for i in range(current_pos, min(current_pos + role_length, len(labels))):
-                    if labels[i] != -100:  # Only if not already masked
+                    if labels[i] != -100:
                         if random.random() > self.system_message_weight:
                             labels[i] = -100
-                
                 current_pos += role_length
-            
             elif role == 'user':
-                # Fully mask user messages
                 role_text = f"{self.tokenizer.special_tokens['user_token']} {content}\n"
                 role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                
                 for i in range(current_pos, min(current_pos + role_length, len(labels))):
                     labels[i] = -100
-                
                 current_pos += role_length
-            
             elif role == 'assistant':
-                # Keep assistant messages for training
                 role_text = f"{self.tokenizer.special_tokens['assistant_token']} {content}\n"
                 role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                
-                # Keep these tokens for training (don't mask)
                 current_pos += role_length
-        
+
+        # Guarantee at least one unmasked label (not -100)
+        if (labels != -100).sum().item() == 0:
+            # Unmask the last non-padding token
+            nonpad_indices = (input_ids != self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            if len(nonpad_indices) > 0:
+                last_idx = nonpad_indices[-1].item()
+                labels[last_idx] = input_ids[last_idx]
+            else:
+                labels[-1] = input_ids[-1]
+
         example['labels'] = labels
         return example
 
@@ -597,9 +589,19 @@ class SupernovaTrainer:
         
         self.model.train()
         
+
         # Move batch to device and ensure float32
         batch = {k: v.to(self.device) for k, v in batch.items()}
-        
+
+        # Check number of unmasked labels
+        if 'labels' in batch:
+            num_unmasked = (batch['labels'] != -100).sum().item()
+            if num_unmasked == 0:
+                self.logger.warning('All labels are masked in this batch. Skipping batch.')
+                return 0.0
+            else:
+                self.logger.debug(f'Unmasked labels in batch: {num_unmasked}')
+
         # Clear gradients
         self.optimizer.zero_grad(set_to_none=True)
         
@@ -623,21 +625,34 @@ class SupernovaTrainer:
                 self.logger.warning(f"Found NaN/Inf loss after scaling: {loss.item()}")
                 return 0.0
             
+
             # Backward pass with gradient scaling
             loss.backward()
-            
-            # Check gradients for NaN/Inf
+
+            # Check gradients for NaN/Inf and count nonzero gradients
             valid_gradients = True
+            nonzero_grad_count = 0
+            total_param_count = 0
             for name, param in self.model.named_parameters():
                 if param.grad is not None:
+                    total_param_count += 1
                     if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                         self.logger.warning(f"Found NaN/Inf gradients in {name}")
                         valid_gradients = False
                         break
-            
+                    if param.grad.abs().sum().item() > 0:
+                        nonzero_grad_count += 1
+
             if not valid_gradients:
                 self.optimizer.zero_grad(set_to_none=True)
                 return 0.0
+
+            if nonzero_grad_count == 0:
+                self.logger.warning('All gradients are zero after backward! Skipping optimizer step.')
+                self.optimizer.zero_grad(set_to_none=True)
+                return 0.0
+            else:
+                self.logger.debug(f'Nonzero gradients: {nonzero_grad_count}/{total_param_count}')
             
             # Clip gradients
             if self.config.gradient_clipping > 0:
