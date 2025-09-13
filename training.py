@@ -155,61 +155,21 @@ class ConversationDataset(Dataset):
             max_length=self.max_length
         )
         
-        # Apply conversation-specific modifications
-        if self.mask_user_tokens:
-            formatted_example = self.apply_conversation_masking(
-                formatted_example, messages
-            )
-        
-        return formatted_example
-    
-    def apply_conversation_masking(
-        self, 
-        example: Dict[str, torch.Tensor], 
-        messages: List[Dict[str, str]]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply conversation-specific loss masking and guarantee at least one unmasked label."""
-        input_ids = example['input_ids']
-        labels = example['labels'].clone()
-
-        # Create a more sophisticated masking strategy
-        # We want to train primarily on assistant responses
-        full_text = self.tokenizer.format_chat_prompt(messages, add_generation_prompt=False)
-        current_pos = 0
-        for message in messages:
-            role = message['role']
-            content = message['content']
-            if role == 'system':
-                role_text = f"{self.tokenizer.special_tokens['system_token']} {content}\n"
-                role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                for i in range(current_pos, min(current_pos + role_length, len(labels))):
-                    if labels[i] != -100:
-                        if random.random() > self.system_message_weight:
-                            labels[i] = -100
-                current_pos += role_length
-            elif role == 'user':
-                role_text = f"{self.tokenizer.special_tokens['user_token']} {content}\n"
-                role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                for i in range(current_pos, min(current_pos + role_length, len(labels))):
-                    labels[i] = -100
-                current_pos += role_length
-            elif role == 'assistant':
-                role_text = f"{self.tokenizer.special_tokens['assistant_token']} {content}\n"
-                role_length = len(self.tokenizer.encode(role_text, add_special_tokens=False))
-                current_pos += role_length
-
-        # Guarantee at least one unmasked label (not -100)
+        # Only apply masking in format_training_example, not here
+        # Guarantee at least one unmasked label (not -100) right before returning
+        labels = formatted_example['labels']
+        input_ids = formatted_example['input_ids']
         if (labels != -100).sum().item() == 0:
-            # Unmask the last non-padding token
             nonpad_indices = (input_ids != self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
             if len(nonpad_indices) > 0:
                 last_idx = nonpad_indices[-1].item()
                 labels[last_idx] = input_ids[last_idx]
             else:
                 labels[-1] = input_ids[-1]
-
-        example['labels'] = labels
-        return example
+            formatted_example['labels'] = labels
+        return formatted_example
+    
+    # Removed apply_conversation_masking: masking is now only in format_training_example
 
 
 def create_sample_training_data(output_path: str = "sample_train_data.json", num_samples: int = 100):
@@ -506,10 +466,9 @@ class SupernovaTrainer:
         input_ids = torch.stack([item['input_ids'] for item in batch])
         labels = torch.stack([item['labels'] for item in batch])
         attention_mask = torch.stack([item['attention_mask'] for item in batch])
-        # Data validation: warn if all labels are masked in any batch
-        # This check helps catch silent failures in the data pipeline or masking logic.
+        # Data validation: abort if all labels are masked in any batch
         if (labels != -100).sum().item() == 0:
-            print('Warning: All labels are masked in a batch!')
+            raise RuntimeError('ERROR: All labels are masked in a batch! This should never happen.')
         return {
             'input_ids': input_ids,
             'labels': labels,
