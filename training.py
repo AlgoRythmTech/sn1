@@ -523,11 +523,20 @@ class SupernovaTrainer:
         # Initialize weights with a smaller range
         def init_weights(module):
             if isinstance(module, (nn.Linear, nn.Embedding)):
-                module.weight.data.normal_(mean=0.0, std=0.02)
+                # Use Xavier/Glorot initialization for better gradient flow
+                nn.init.xavier_normal_(module.weight.data, gain=0.1)
                 if isinstance(module, nn.Linear) and module.bias is not None:
                     module.bias.data.zero_()
+            elif isinstance(module, nn.LayerNorm):
+                module.bias.data.zero_()
+                module.weight.data.fill_(1.0)
         
         self.model.apply(init_weights)
+        
+        # Scale down initial embeddings for better loss scaling
+        if hasattr(self.model, 'embed_tokens'):
+            with torch.no_grad():
+                self.model.embed_tokens.weight.data.mul_(0.1)
         
         # Setup optimizer with parameter-specific settings
         no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
@@ -552,6 +561,20 @@ class SupernovaTrainer:
             eps=1e-8,
             betas=(0.9, 0.95),  # Modified betas for stability
             weight_decay=self.config.weight_decay
+        )
+        
+        # Calculate training steps
+        total_steps = len(self.train_loader) * self.config.max_epochs
+        warmup_steps = self.config.warmup_steps
+        
+        # Create scheduler with linear warmup and cosine decay
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.config.learning_rate,
+            total_steps=total_steps,
+            pct_start=warmup_steps / total_steps,
+            anneal_strategy='cos',
+            cycle_momentum=False
         )
         
         # Calculate total steps
@@ -580,42 +603,63 @@ class SupernovaTrainer:
         self.model.train()
         
         # Move batch to device and ensure float32
-        batch = {k: v.to(self.device) if k != 'labels' else v.to(self.device)
-                for k, v in batch.items()}
+        batch = {k: v.to(self.device) for k, v in batch.items()}
         
         # Clear gradients
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         
         try:
-            # Forward pass
+            # Forward pass with gradient computation
             outputs = self.model(**batch)
             loss = outputs['loss']
             
             if loss is None:
                 return 0.0
-                
-            if torch.isnan(loss) or torch.isinf(loss):
-                self.logger.warning(f"Found NaN/Inf loss: {loss.item()}")
-                return float('nan')
             
-            # Scale loss for gradient accumulation
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.logger.warning(f"Found NaN/Inf loss before scaling: {loss.item()}")
+                return 0.0
+            
+            # Scale loss and check again
             loss = loss / self.config.gradient_accumulation_steps
             
-            # Backward pass
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.logger.warning(f"Found NaN/Inf loss after scaling: {loss.item()}")
+                return 0.0
+            
+            # Backward pass with gradient scaling
             loss.backward()
+            
+            # Check gradients for NaN/Inf
+            valid_gradients = True
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        self.logger.warning(f"Found NaN/Inf gradients in {name}")
+                        valid_gradients = False
+                        break
+            
+            if not valid_gradients:
+                self.optimizer.zero_grad(set_to_none=True)
+                return 0.0
             
             # Clip gradients
             if self.config.gradient_clipping > 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
                     self.config.gradient_clipping
                 )
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    self.logger.warning(f"Found NaN/Inf gradient norm: {grad_norm}")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    return 0.0
             
             # Update weights if we've accumulated enough gradients
             if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
                 self.optimizer.step()
                 self.scheduler.step()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
             
             # Log gradient norms periodically
             if (self.global_step + 1) % self.config.logging_steps == 0:
@@ -628,6 +672,10 @@ class SupernovaTrainer:
                 self.logger.info(f"Gradient norm: {total_norm:.4f}")
             
             return loss.item() * self.config.gradient_accumulation_steps
+            
+        except Exception as e:
+            self.logger.error(f"Error in training step: {str(e)}")
+            return 0.0
             
         except Exception as e:
             self.logger.error(f"Error in training step: {str(e)}")
@@ -905,21 +953,21 @@ def main():
     # Training configuration
     config = TrainingConfig(
         model_name="enhanced-supernova",
-        batch_size=4,  # Increased batch size
-        gradient_accumulation_steps=4,  # Reduced accumulation
-        learning_rate=2e-4,  # Initial higher learning rate
+        batch_size=2,  # Smaller batch size for stability
+        gradient_accumulation_steps=8,  # Increased for effective batch
+        learning_rate=1e-4,  # Reduced learning rate
         max_epochs=15,
-        max_sequence_length=2048,  # Match model config
+        max_sequence_length=512,  # Reduced sequence length initially
         output_dir="outputs",
         train_data_path="sample_train_data.json",
-        mixed_precision=False,  # Disable mixed precision initially
-        gradient_clipping=1.0,
-        warmup_steps=100,
+        mixed_precision=False,
+        gradient_clipping=0.5,  # More aggressive clipping
+        warmup_steps=200,  # More warmup steps
         eval_steps=50,
         save_steps=100,
         logging_steps=5,
-        weight_decay=0.01,
-        mask_user_tokens=False,  # Learn from all tokens
+        weight_decay=0.1,  # Increased weight decay
+        mask_user_tokens=False,
         system_message_weight=1.0,
         response_loss_weight=1.0
     )

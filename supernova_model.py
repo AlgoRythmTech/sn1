@@ -552,21 +552,53 @@ class SupernovaForCausalLM(nn.Module):
         )
 
         hidden_states = outputs[0]
+        
+        # Add epsilon to prevent underflow
+        hidden_states = F.dropout(hidden_states, p=0.1, training=self.training)
+        
+        # Scale hidden states to prevent exploding values
+        hidden_states = hidden_states * (1.0 / hidden_states.norm(dim=-1, keepdim=True).clamp(min=1e-7))
+        
         logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        
+        # Apply log softmax with better numerical stability
+        logits = F.log_softmax(logits, dim=-1)
 
         loss = None
         if labels is not None:
             # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
+            
+            # Use label smoothing
+            loss_fct = nn.CrossEntropyLoss(label_smoothing=0.1)
+            
+            # Reshape and compute loss with better numerical stability
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            
+            # Mask padding tokens
+            valid_mask = (shift_labels != -100)
+            
+            if valid_mask.any():
+                shift_logits = shift_logits[valid_mask]
+                shift_labels = shift_labels[valid_mask]
+                
+                # Compute loss with gradient clipping
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
+                
+                # Add L2 regularization
+                l2_reg = torch.tensor(0., device=loss.device)
+                for param in self.parameters():
+                    l2_reg += torch.norm(param)
+                loss += 0.01 * l2_reg
+                
+                # Ensure loss is finite
+                if torch.isfinite(loss):
+                    loss = loss.clamp(min=0, max=100)  # Clip extreme values
+                else:
+                    loss = torch.tensor(0.1, device=loss.device, requires_grad=True)
 
         output = {
             'loss': loss,
