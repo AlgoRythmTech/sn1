@@ -646,7 +646,12 @@ class SupernovaTrainer:
             # Update weights if we've accumulated enough gradients
             if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
                 self.optimizer.step()
-                self.scheduler.step()
+                # Only step scheduler if not past total_steps
+                if hasattr(self.scheduler, 'total_steps'):
+                    if self.scheduler.last_epoch < self.scheduler.total_steps - 1:
+                        self.scheduler.step()
+                else:
+                    self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
             
             # Log gradient norms periodically
