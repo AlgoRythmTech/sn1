@@ -570,35 +570,30 @@ class SupernovaForCausalLM(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Use label smoothing
-            loss_fct = nn.CrossEntropyLoss(label_smoothing=0.1)
+            # Basic cross entropy loss without label smoothing initially
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
             
-            # Reshape and compute loss with better numerical stability
+            # Reshape and compute loss
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             
-            # Mask padding tokens
-            valid_mask = (shift_labels != -100)
+            # Ensure we're on the same device
+            shift_labels = shift_labels.to(shift_logits.device)
             
-            if valid_mask.any():
-                shift_logits = shift_logits[valid_mask]
-                shift_labels = shift_labels[valid_mask]
-                
-                # Compute loss with gradient clipping
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                
-                # Add L2 regularization
-                l2_reg = torch.tensor(0., device=loss.device)
-                for param in self.parameters():
-                    l2_reg += torch.norm(param)
-                loss += 0.01 * l2_reg
-                
-                # Ensure loss is finite
-                if torch.isfinite(loss):
-                    loss = loss.clamp(min=0, max=100)  # Clip extreme values
-                else:
-                    loss = torch.tensor(0.1, device=loss.device, requires_grad=True)
+            # Compute main loss
+            loss = loss_fct(shift_logits, shift_labels)
+            
+            # Add a small epsilon to prevent exactly zero loss
+            loss = loss + 1e-8
+            
+            # Simple L2 regularization
+            if self.training:
+                l2_reg = 0.01 * sum(p.pow(2.0).sum() for p in self.parameters())
+                loss = loss + l2_reg
+            
+            # Ensure loss is finite and reasonable
+            if not torch.isfinite(loss):
+                loss = torch.tensor(1.0, device=loss.device, requires_grad=True)
 
         output = {
             'loss': loss,

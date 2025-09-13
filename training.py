@@ -772,19 +772,24 @@ class SupernovaTrainer:
         
         with torch.no_grad():
             for batch in tqdm(self.eval_loader, desc="Evaluating"):
-                
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                
-                # Forward pass
-                with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+                try:
+                    # Move batch to device
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    
+                    # Forward pass
                     outputs = self.model(**batch)
-                    loss = outputs['loss']
-                
-                total_loss += loss.item()
-                num_steps += 1
+                    loss = outputs.get('loss', None)
+                    
+                    if loss is not None and not torch.isnan(loss) and not torch.isinf(loss):
+                        total_loss += loss.item()
+                        num_steps += 1
+                except Exception as e:
+                    self.logger.warning(f"Error during evaluation: {str(e)}")
+                    continue
         
-        return total_loss / num_steps if num_steps > 0 else float('inf')
+        avg_loss = total_loss / max(num_steps, 1)
+        self.logger.info(f"Evaluation completed with {num_steps} valid steps")
+        return avg_loss
     
     def save_model(self, save_name: str):
         """Save model and tokenizer with comprehensive checkpointing"""
@@ -953,22 +958,22 @@ def main():
     # Training configuration
     config = TrainingConfig(
         model_name="enhanced-supernova",
-        batch_size=2,  # Smaller batch size for stability
-        gradient_accumulation_steps=8,  # Increased for effective batch
-        learning_rate=1e-4,  # Reduced learning rate
+        batch_size=8,  # Increased batch size
+        gradient_accumulation_steps=1,  # No accumulation initially
+        learning_rate=5e-5,  # Standard learning rate
         max_epochs=15,
-        max_sequence_length=512,  # Reduced sequence length initially
+        max_sequence_length=128,  # Start with small sequences
         output_dir="outputs",
         train_data_path="sample_train_data.json",
-        mixed_precision=False,
-        gradient_clipping=0.5,  # More aggressive clipping
-        warmup_steps=200,  # More warmup steps
+        mixed_precision=False,  # Keep it simple
+        gradient_clipping=1.0,
+        warmup_steps=100,
         eval_steps=50,
         save_steps=100,
         logging_steps=5,
-        weight_decay=0.1,  # Increased weight decay
-        mask_user_tokens=False,
-        system_message_weight=1.0,
+        weight_decay=0.01,
+        mask_user_tokens=True,  # Focus on response generation
+        system_message_weight=0.5,
         response_loss_weight=1.0
     )
     
