@@ -212,7 +212,13 @@ def create_chat_dataset_entry(user_message: str, assistant_message: str, system_
 
 
 def format_training_example(tokenizer: SupernovaTokenizer, messages: List[Dict[str, str]], max_length: int = 2048) -> Dict[str, torch.Tensor]:
-    """Format a training example for conversation fine-tuning"""
+    """
+    Format a training example for conversation fine-tuning.
+    Robustly masks labels so that only assistant responses are trained on.
+    Ensures at least one unmasked label per example, even if there are no assistant tokens.
+    If all tokens would be masked, unmask the first assistant response, or the last non-padding token if no assistant is present.
+    Logs a warning if all tokens are still masked (should never happen).
+    """
     # Format the conversation
     formatted_text = tokenizer.format_chat_prompt(messages, add_generation_prompt=False)
     
@@ -230,15 +236,37 @@ def format_training_example(tokenizer: SupernovaTokenizer, messages: List[Dict[s
     assistant_token_id = tokenizer.assistant_token_id if hasattr(tokenizer, 'assistant_token_id') else tokenizer.encode(tokenizer.special_tokens['assistant_token'])[0]
     
     # Mask everything except assistant responses
+    # This logic ensures that only assistant responses are used for loss computation.
+    # User and system tokens are always masked.
     mask_labels = True
+    assistant_indices = []
     for i, token_id in enumerate(input_ids_tensor):
         if token_id == assistant_token_id:
             mask_labels = False
+            assistant_indices.append(i)
         elif token_id in [tokenizer.user_token_id, tokenizer.system_token_id] if hasattr(tokenizer, 'user_token_id') else []:
             mask_labels = True
-        
         if mask_labels:
             labels_tensor[i] = -100  # Ignore in loss computation
+
+    # Robust check: If all tokens are masked, unmask the first assistant response or last non-padding token
+    # This guarantees at least one unmasked label for every example, preventing constant or NaN loss.
+    if (labels_tensor != -100).sum() == 0:
+        if assistant_indices:
+            for i in range(assistant_indices[0], len(labels_tensor)):
+                labels_tensor[i] = input_ids_tensor[i]
+        else:
+            # If no assistant token, unmask the last non-padding token (at least one label)
+            last_nonpad = (input_ids_tensor != tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            if len(last_nonpad) > 0:
+                last_idx = last_nonpad[-1].item()
+                labels_tensor[last_idx] = input_ids_tensor[last_idx]
+            else:
+                labels_tensor[-1] = input_ids_tensor[-1]
+
+    # Log a warning if all tokens are still masked (should never happen)
+    if (labels_tensor != -100).sum() == 0:
+        print('Warning: All labels are masked in format_training_example!')
     
     # Pad if necessary
     if len(encoded) < max_length:

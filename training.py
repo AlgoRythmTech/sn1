@@ -504,13 +504,19 @@ class SupernovaTrainer:
         self.logger.info(f"Evaluation samples: {len(eval_dataset)}")
     
     def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Collate function for data loader"""
-        
+        """
+        Collate function for data loader.
+        Stacks tensors and performs a batch-level validation check:
+        Warns if all labels in a batch are masked, which would indicate a data or masking bug.
+        """
         # Stack tensors
         input_ids = torch.stack([item['input_ids'] for item in batch])
         labels = torch.stack([item['labels'] for item in batch])
         attention_mask = torch.stack([item['attention_mask'] for item in batch])
-        
+        # Data validation: warn if all labels are masked in any batch
+        # This check helps catch silent failures in the data pipeline or masking logic.
+        if (labels != -100).sum().item() == 0:
+            print('Warning: All labels are masked in a batch!')
         return {
             'input_ids': input_ids,
             'labels': labels,
