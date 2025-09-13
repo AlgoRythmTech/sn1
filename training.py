@@ -407,10 +407,29 @@ class SupernovaTrainer:
             # Create model with full vocab size
             config = SupernovaConfig()
             config.vocab_size = len(self.tokenizer)
-            config.hidden_size = 768  # Standard size for medium model
+            config.hidden_size = 768
+            config.num_hidden_layers = 12
+            config.num_attention_heads = 12
+            config.num_key_value_heads = 12
+            config.intermediate_size = 3072
+            config.hidden_act = "swiglu"
+            config.max_position_embeddings = 2048
+            config.initializer_range = 0.02
+            config.rms_norm_eps = 1e-6
+            config.use_cache = True
+            config.tie_word_embeddings = True
+            config.attention_bias = False
+            config.attention_dropout = 0.1
+            config.hidden_dropout = 0.1
             config.device = self.device
             config.dtype = torch.float32
-            self.model = create_supernova_model(config)
+            self.model = create_supernova_model(vocab_size=config.vocab_size,
+                                              hidden_size=config.hidden_size,
+                                              num_layers=config.num_hidden_layers,
+                                              num_heads=config.num_attention_heads,
+                                              num_kv_heads=config.num_key_value_heads,
+                                              intermediate_size=config.intermediate_size,
+                                              max_position_embeddings=config.max_position_embeddings)
         
         # Move model to device
         self.model.to(self.device)
@@ -531,7 +550,7 @@ class SupernovaTrainer:
             optimizer_grouped_parameters,
             lr=self.config.learning_rate,
             eps=1e-8,
-            betas=(0.9, 0.999),  # Default AdamW betas
+            betas=(0.9, 0.95),  # Modified betas for stability
             weight_decay=self.config.weight_decay
         )
         
@@ -560,68 +579,59 @@ class SupernovaTrainer:
         
         self.model.train()
         
-        # Move batch to device
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        # Move batch to device and ensure float32
+        batch = {k: v.to(self.device) if k != 'labels' else v.to(self.device)
+                for k, v in batch.items()}
         
         # Clear gradients
         self.optimizer.zero_grad()
         
-        # Forward pass with gradient computation
-        loss = None
-        if self.config.mixed_precision:
-            with torch.cuda.amp.autocast():
-                outputs = self.model(**batch)
-                loss = outputs['loss']
-                
-                if torch.isnan(loss) or torch.isinf(loss):
-                    self.logger.warning(f"Found NaN/Inf loss: {loss.item()}")
-                    return float('nan')
-                
-                # Scale loss for gradient accumulation
-                loss = loss / self.config.gradient_accumulation_steps
-            
-            # Scale and backward
-            scaled_loss = self.scaler.scale(loss)
-            scaled_loss.backward()
-            
-            # Gradient clipping
-            if self.config.gradient_clipping > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
-            
-            # Update weights
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            
-        else:
+        try:
+            # Forward pass
             outputs = self.model(**batch)
             loss = outputs['loss']
             
+            if loss is None:
+                return 0.0
+                
             if torch.isnan(loss) or torch.isinf(loss):
                 self.logger.warning(f"Found NaN/Inf loss: {loss.item()}")
                 return float('nan')
             
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
+            
+            # Backward pass
             loss.backward()
             
-            # Gradient clipping
+            # Clip gradients
             if self.config.gradient_clipping > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.gradient_clipping
+                )
             
-            self.optimizer.step()
-        
-        # Log gradient norms for debugging
-        if (self.global_step + 1) % self.config.logging_steps == 0:
-            total_norm = 0.0
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            self.logger.info(f"Gradient norm: {total_norm:.4f}")
-        
-        return loss.item() * self.config.gradient_accumulation_steps
+            # Update weights if we've accumulated enough gradients
+            if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            # Log gradient norms periodically
+            if (self.global_step + 1) % self.config.logging_steps == 0:
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                self.logger.info(f"Gradient norm: {total_norm:.4f}")
+            
+            return loss.item() * self.config.gradient_accumulation_steps
+            
+        except Exception as e:
+            self.logger.error(f"Error in training step: {str(e)}")
+            raise e
     
     def train_epoch(self) -> float:
         """Train for one epoch"""
@@ -895,23 +905,23 @@ def main():
     # Training configuration
     config = TrainingConfig(
         model_name="enhanced-supernova",
-        batch_size=1,  # Single sample for stable training
-        gradient_accumulation_steps=16,  # Increased for effective batch size
-        learning_rate=5e-6,  # Even lower learning rate for stability
+        batch_size=4,  # Increased batch size
+        gradient_accumulation_steps=4,  # Reduced accumulation
+        learning_rate=2e-4,  # Initial higher learning rate
         max_epochs=15,
-        max_sequence_length=1024,
+        max_sequence_length=2048,  # Match model config
         output_dir="outputs",
         train_data_path="sample_train_data.json",
-        mixed_precision=True,
-        gradient_clipping=0.1,  # More aggressive gradient clipping
-        warmup_steps=500,  # More warmup steps
+        mixed_precision=False,  # Disable mixed precision initially
+        gradient_clipping=1.0,
+        warmup_steps=100,
         eval_steps=50,
         save_steps=100,
         logging_steps=5,
-        weight_decay=0.01,  # Reduced weight decay
-        mask_user_tokens=False,  # Allow model to learn from all tokens
-        system_message_weight=1.0,  # Full weight on system messages
-        response_loss_weight=1.0  # Full weight on assistant responses
+        weight_decay=0.01,
+        mask_user_tokens=False,  # Learn from all tokens
+        system_message_weight=1.0,
+        response_loss_weight=1.0
     )
     
     # Create trainer and start training
