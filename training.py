@@ -407,6 +407,9 @@ class SupernovaTrainer:
             # Create model with full vocab size
             config = SupernovaConfig()
             config.vocab_size = len(self.tokenizer)
+            config.hidden_size = 768  # Standard size for medium model
+            config.device = self.device
+            config.dtype = torch.float32
             self.model = create_supernova_model(config)
         
         # Move model to device
