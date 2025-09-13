@@ -712,7 +712,12 @@ class SupernovaTrainer:
                 else:
                     self.optimizer.step()
                 
-                self.scheduler.step()
+                # Only step scheduler if not past total_steps
+                if hasattr(self.scheduler, 'total_steps'):
+                    if self.scheduler.last_epoch < self.scheduler.total_steps - 1:
+                        self.scheduler.step()
+                else:
+                    self.scheduler.step()
                 self.optimizer.zero_grad()
                 
                 self.global_step += 1
