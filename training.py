@@ -405,19 +405,9 @@ class SupernovaTrainer:
         else:
             self.logger.info("Creating new Supernova model")
             # Create model with full vocab size
-            config = SupernovaConfig(
-                vocab_size=len(self.tokenizer),
-                hidden_size=768,
-                num_hidden_layers=12,
-                num_attention_heads=12,
-                intermediate_size=3072,
-                hidden_dropout_prob=0.1,
-                attention_probs_dropout_prob=0.1,
-                max_position_embeddings=1024,
-                type_vocab_size=2,
-                initializer_range=0.02
-            )
-            self.model = create_supernova_model(config=config)
+            config = SupernovaConfig()
+            config.vocab_size = len(self.tokenizer)
+            self.model = create_supernova_model(config)
         
         # Move model to device
         self.model.to(self.device)
