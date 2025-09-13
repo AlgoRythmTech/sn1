@@ -560,9 +560,6 @@ class SupernovaForCausalLM(nn.Module):
         hidden_states = hidden_states * (1.0 / hidden_states.norm(dim=-1, keepdim=True).clamp(min=1e-7))
         
         logits = self.lm_head(hidden_states)
-        
-        # Apply log softmax with better numerical stability
-        logits = F.log_softmax(logits, dim=-1)
 
         loss = None
         if labels is not None:
