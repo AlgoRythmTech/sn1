@@ -1,0 +1,67 @@
+# Trained Models (too large for git)
+outputs/
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# API Keys and Environment
+.env
+*.key
+config.json
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTorch Cache
+torch_cache/
+hf_cache/
+.cache/
+
+# Training Logs
+*.log
+logs/
+tensorboard_logs/
+
+# Conversations (may contain private data)
+conversations/
+*.json
+
+# Temporary Files
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE Files
+.vscode/
+.idea/
+*.sublime-*
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Sample Data (gets created automatically)
+sample_train_data.json
+enhanced_training_data.json
