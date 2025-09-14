@@ -553,11 +553,9 @@ class SupernovaForCausalLM(nn.Module):
 
         hidden_states = outputs[0]
         
-        # Add epsilon to prevent underflow
-        hidden_states = F.dropout(hidden_states, p=0.1, training=self.training)
-        
-        # Scale hidden states to prevent exploding values
-        hidden_states = hidden_states * (1.0 / hidden_states.norm(dim=-1, keepdim=True).clamp(min=1e-7))
+        # Simple dropout without normalization
+        if self.training:
+            hidden_states = F.dropout(hidden_states, p=0.1, training=True)
         
         logits = self.lm_head(hidden_states)
 
@@ -567,30 +565,22 @@ class SupernovaForCausalLM(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Basic cross entropy loss without label smoothing initially
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
-            
-            # Reshape and compute loss
+            # Flatten for loss computation
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             
-            # Ensure we're on the same device
-            shift_labels = shift_labels.to(shift_logits.device)
+            # Only compute loss on non-masked tokens
+            valid_indices = (shift_labels != -100)
             
-            # Compute main loss
-            loss = loss_fct(shift_logits, shift_labels)
-            
-            # Add a small epsilon to prevent exactly zero loss
-            loss = loss + 1e-8
-            
-            # Simple L2 regularization
-            if self.training:
-                l2_reg = 0.01 * sum(p.pow(2.0).sum() for p in self.parameters())
-                loss = loss + l2_reg
-            
-            # Ensure loss is finite and reasonable
-            if not torch.isfinite(loss):
-                loss = torch.tensor(1.0, device=loss.device, requires_grad=True)
+            if valid_indices.sum() > 0:
+                # Standard cross entropy loss
+                loss_fct = nn.CrossEntropyLoss(reduction='mean')
+                valid_logits = shift_logits[valid_indices]
+                valid_labels = shift_labels[valid_indices]
+                loss = loss_fct(valid_logits, valid_labels)
+            else:
+                # If no valid labels, return a small loss to avoid zero gradients
+                loss = torch.tensor(0.01, device=logits.device, requires_grad=True)
 
         output = {
             'loss': loss,

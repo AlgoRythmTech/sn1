@@ -214,59 +214,59 @@ def create_chat_dataset_entry(user_message: str, assistant_message: str, system_
 def format_training_example(tokenizer: SupernovaTokenizer, messages: List[Dict[str, str]], max_length: int = 2048) -> Dict[str, torch.Tensor]:
     """
     Format a training example for conversation fine-tuning.
-    Robustly masks labels so that only assistant responses are trained on.
-    Ensures at least one unmasked label per example, even if there are no assistant tokens.
-    If all tokens would be masked, unmask the first assistant response, or the last non-padding token if no assistant is present.
-    Logs a warning if all tokens are still masked (should never happen).
+    Only trains on assistant responses, ensuring proper gradient flow.
     """
     # Format the conversation
     formatted_text = tokenizer.format_chat_prompt(messages, add_generation_prompt=False)
     
-    # Encode
+    # Encode with truncation
     encoded = tokenizer.encode(formatted_text, max_length=max_length)
+    if len(encoded) > max_length:
+        encoded = encoded[:max_length]
     
-    # Create labels (same as input_ids for causal LM)
-    labels = encoded.copy()
+    # Create tensors
+    input_ids_tensor = torch.tensor(encoded, dtype=torch.long)
+    labels_tensor = torch.full_like(input_ids_tensor, -100)  # Start with all masked
     
-    # Mask user and system tokens in labels (only train on assistant responses)
-    input_ids_tensor = torch.tensor(encoded)
-    labels_tensor = torch.tensor(labels)
+    # Get special token IDs
+    assistant_token_text = tokenizer.special_tokens['assistant_token']
+    assistant_token_ids = tokenizer.encode(assistant_token_text, add_special_tokens=False)
+    if assistant_token_ids:
+        assistant_token_id = assistant_token_ids[0]
+    else:
+        assistant_token_id = tokenizer.assistant_token_id
     
-    # Find assistant response start positions
-    assistant_token_id = tokenizer.assistant_token_id if hasattr(tokenizer, 'assistant_token_id') else tokenizer.encode(tokenizer.special_tokens['assistant_token'])[0]
+    # Find all assistant response sections
+    in_assistant_response = False
+    assistant_start_positions = []
     
-    # Mask everything except assistant responses
-    # This logic ensures that only assistant responses are used for loss computation.
-    # User and system tokens are always masked.
-    mask_labels = True
-    assistant_indices = []
     for i, token_id in enumerate(input_ids_tensor):
         if token_id == assistant_token_id:
-            mask_labels = False
-            assistant_indices.append(i)
-        elif token_id in [tokenizer.user_token_id, tokenizer.system_token_id] if hasattr(tokenizer, 'user_token_id') else []:
-            mask_labels = True
-        if mask_labels:
-            labels_tensor[i] = -100  # Ignore in loss computation
-
-    # Robust check: If all tokens are masked, unmask the first assistant response or last non-padding token
-    # This guarantees at least one unmasked label for every example, preventing constant or NaN loss.
-    if (labels_tensor != -100).sum() == 0:
-        if assistant_indices:
-            for i in range(assistant_indices[0], len(labels_tensor)):
-                labels_tensor[i] = input_ids_tensor[i]
-        else:
-            # If no assistant token, unmask the last non-padding token (at least one label)
-            last_nonpad = (input_ids_tensor != tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
-            if len(last_nonpad) > 0:
-                last_idx = last_nonpad[-1].item()
-                labels_tensor[last_idx] = input_ids_tensor[last_idx]
-            else:
-                labels_tensor[-1] = input_ids_tensor[-1]
-
-    # Log a warning if all tokens are still masked (should never happen)
-    if (labels_tensor != -100).sum() == 0:
-        print('Warning: All labels are masked in format_training_example!')
+            in_assistant_response = True
+            assistant_start_positions.append(i + 1)  # Start unmasking after the token
+        elif token_id == tokenizer.user_token_id or token_id == tokenizer.system_token_id:
+            in_assistant_response = False
+        elif in_assistant_response and token_id != tokenizer.pad_token_id:
+            # Unmask assistant response tokens (but not the assistant token itself)
+            labels_tensor[i] = token_id
+    
+    # Ensure we have at least some unmasked labels
+    unmasked_count = (labels_tensor != -100).sum().item()
+    
+    if unmasked_count == 0:
+        # Emergency fallback: unmask the last few tokens
+        valid_indices = (input_ids_tensor != tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+        if len(valid_indices) > 0:
+            # Unmask last 5 tokens or all available tokens, whichever is smaller
+            start_idx = max(0, len(valid_indices) - 5)
+            for i in range(start_idx, len(valid_indices)):
+                idx = valid_indices[i].item()
+                labels_tensor[idx] = input_ids_tensor[idx]
+    
+    unmasked_count = (labels_tensor != -100).sum().item()
+    if unmasked_count == 0:
+        # Last resort: unmask the final token
+        labels_tensor[-1] = input_ids_tensor[-1]
     
     # Pad if necessary
     if len(encoded) < max_length:

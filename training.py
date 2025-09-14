@@ -21,7 +21,7 @@ import random
 import numpy as np
 import math
 
-from supernova_model import SupernovaForCausalLM, SupernovaConfig, create_supernova_model
+from supernova_model import SupernovaForCausalLM, SupernovaConfig, create_supernova_model, RMSNorm
 from tokenizer import SupernovaTokenizer, format_training_example
 from chat_interface import SupernovaChat
 
@@ -478,23 +478,25 @@ class SupernovaTrainer:
     def setup_optimizer_and_scheduler(self):
         """Setup optimizer and learning rate scheduler"""
         
-        # Initialize weights with a smaller range
+        # Proper transformer initialization - don't re-initialize if already done
         def init_weights(module):
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                # Use Xavier/Glorot initialization for better gradient flow
-                nn.init.xavier_normal_(module.weight.data, gain=0.1)
-                if isinstance(module, nn.Linear) and module.bias is not None:
+            if isinstance(module, nn.Linear):
+                # Standard transformer initialization
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=0.02)
+                if module.bias is not None:
                     module.bias.data.zero_()
-            elif isinstance(module, nn.LayerNorm):
-                module.bias.data.zero_()
-                module.weight.data.fill_(1.0)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight.data, mean=0.0, std=0.02)
+            elif isinstance(module, (nn.LayerNorm, RMSNorm)):
+                if hasattr(module, 'bias') and module.bias is not None:
+                    module.bias.data.zero_()
+                if hasattr(module, 'weight'):
+                    module.weight.data.fill_(1.0)
         
-        self.model.apply(init_weights)
-        
-        # Scale down initial embeddings for better loss scaling
-        if hasattr(self.model, 'embed_tokens'):
-            with torch.no_grad():
-                self.model.embed_tokens.weight.data.mul_(0.1)
+        # Only apply initialization if model wasn't already initialized properly
+        if not hasattr(self.model, '_initialized'):
+            self.model.apply(init_weights)
+            self.model._initialized = True
         
         # Setup optimizer with parameter-specific settings
         no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
@@ -525,17 +527,21 @@ class SupernovaTrainer:
         total_steps = len(self.train_loader) * self.config.max_epochs
         if self.config.max_steps:
             total_steps = min(total_steps, self.config.max_steps)
-        warmup_steps = self.config.warmup_steps
+        warmup_steps = min(self.config.warmup_steps, total_steps // 10)  # Cap warmup at 10% of total steps
         
-        # Create scheduler with linear warmup and cosine decay
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.config.learning_rate,
-            total_steps=total_steps,
-            pct_start=warmup_steps / total_steps,
-            anneal_strategy='cos',
-            cycle_momentum=False
-        )
+        # Create a more stable scheduler - linear warmup + cosine decay
+        from torch.optim.lr_scheduler import LambdaLR
+        
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return float(current_step) / float(max(1, warmup_steps))
+            else:
+                # Cosine decay with a minimum learning rate
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
         
         # Setup mixed precision
         if self.config.mixed_precision:
@@ -934,25 +940,25 @@ class SupernovaTrainer:
 def main():
     """Main training function"""
     
-    # Training configuration
+    # Training configuration with improved hyperparameters
     config = TrainingConfig(
-        model_name="enhanced-supernova",
-        batch_size=8,  # Increased batch size
-        gradient_accumulation_steps=1,  # No accumulation initially
-        learning_rate=5e-5,  # Standard learning rate
-        max_epochs=15,
-        max_sequence_length=128,  # Start with small sequences
-        output_dir="outputs",
+        model_name="fixed-supernova",
+        batch_size=4,  # Smaller batch for stability
+        gradient_accumulation_steps=2,  # Effective batch size of 8
+        learning_rate=1e-4,  # Higher initial LR
+        max_epochs=10,
+        max_sequence_length=256,  # Larger sequences
+        output_dir="outputs_fixed",
         train_data_path="sample_train_data.json",
-        mixed_precision=False,  # Keep it simple
-        gradient_clipping=1.0,
-        warmup_steps=100,
-        eval_steps=50,
-        save_steps=100,
-        logging_steps=5,
-        weight_decay=0.01,
-        mask_user_tokens=True,  # Focus on response generation
-        system_message_weight=0.5,
+        mixed_precision=False,  # Keep it simple for debugging
+        gradient_clipping=0.5,  # Lower clipping for better gradients
+        warmup_steps=50,  # Shorter warmup
+        eval_steps=25,  # More frequent evaluation
+        save_steps=50,  # More frequent saving
+        logging_steps=1,  # More frequent logging
+        weight_decay=0.001,  # Lower weight decay
+        mask_user_tokens=True,
+        system_message_weight=0.1,
         response_loss_weight=1.0
     )
     
